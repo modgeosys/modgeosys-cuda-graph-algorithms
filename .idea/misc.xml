@@ -3,5 +3,5 @@
   <component name="Black">
     <option name="sdkName" value="modgeosys-cuda-graph-algorithms" />
   </component>
-  <component name="ProjectRootManager" version="2" project-jdk-name="rapids-24.02" project-jdk-type="Python SDK" />
+  <component name="ProjectRootManager" version="2" project-jdk-name="Poetry (modgeosys-cuda-graph-algorithms)" project-jdk-type="Python SDK" />
 </project>
