@@ -1,6 +1,5 @@
 import cupy as cp
 import numpy as np
-import pandas as pd
 import cudf
 import cugraph
 import networkx as nx
@@ -12,12 +11,12 @@ from scipy.sparse.csgraph import floyd_warshall as fw_cpu
 from cualgo.graph import floydwarshall as fw_gpu
 
 
-GRAPH_NODE_COORDS_KEY = 'self.nodes'
-GRAPH_NODE_IDS_KEY = 'self.node_ids'
-GRAPH_TERMINALS_KEY = 'self.terminals'
-GRAPH_EDGES_KEY = 'self.edges'
-GRAPH_REQUIRED_CURRENTS_KEY = 'self.required_currents'
-GRAPH_CABLE_TYPES_KEY = 'cable_types'
+GRAPH_NODE_COORDS = 'node_coords'
+GRAPH_NODE_IDS = 'node_ids'
+GRAPH_TERMINALS = 'terminals'
+GRAPH_EDGES = 'edges'
+GRAPH_REQUIRED_FLOW_RATES = 'required_flow_rates'
+GRAPH_CONDUIT_TYPES = 'conduit_types'
 
 
 
@@ -30,24 +29,27 @@ def is_gpu_available():
 
 use_gpu = False # is_gpu_available()
 
-def manhattan_distance(p1, p2):
+
+def manhattan_distance(p1, p2, use_gpu):
     return cp.abs(p1[0] - p2[0]) + cp.abs(p1[1] - p2[1]) if use_gpu else np.abs(p1[0] - p2[0]) + np.abs(p1[1] - p2[1])
 
-def euclidean_distance(p1, p2):
+
+def euclidean_distance(p1, p2, use_gpu):
     return cp.sqrt((p1[0] - p2[0])**2 + (p1[1] - p2[1])**2) if use_gpu else np.sqrt((p1[0] - p2[0])**2 + (p1[1] - p2[1])**2)
 
-def calculate_optimal_cables(required_current, cable_types):
-    cable_combinations = []
-    for cable in cable_types:
-        count = (required_current + cable['capacity'] - 1) // cable['capacity']
-        total_cost = count * cable['cost']
-        cable_combinations.append((total_cost, count, cable['capacity']))
+
+def calculate_optimal_conduits(required_flow_rate, conduit_types):
+    conduit_combinations = []
+    for conduit in conduit_types:
+        count = (required_flow_rate + conduit['capacity'] - 1) // conduit['capacity']
+        total_cost = count * conduit['cost']
+        conduit_combinations.append((total_cost, count, conduit['capacity']))
     # Select the combination with the minimum total cost
-    optimal_combination = min(cable_combinations, key=lambda x: x[0])
+    optimal_combination = min(conduit_combinations, key=lambda x: x[0])
     return optimal_combination[1], optimal_combination[0]  # Return count and total cost
 
 
-def create_distance_matrix(nodes, edges, distance_func, use_gpu, required_currents, cable_types):
+def create_distance_matrix(nodes, edges, distance_func, use_gpu, required_flow_rates, conduit_types):
     n = len(nodes)
     if use_gpu:
         dist_matrix = cp.full((n, n), cp.inf, dtype=cp.float32)
@@ -55,9 +57,9 @@ def create_distance_matrix(nodes, edges, distance_func, use_gpu, required_curren
         dist_matrix = np.full((n, n), np.inf, dtype=np.float32)
 
     for (u, v, attrs) in edges:
-        dist = distance_func(nodes[u], nodes[v])
-        required_current = required_currents.get((u, v), 0)
-        num_cables, total_cost = calculate_optimal_cables(required_current, cable_types)
+        dist = distance_func(nodes[u], nodes[v], use_gpu)
+        required_flow_rate = required_flow_rates.get((u, v), 0)
+        num_conduits, total_cost = calculate_optimal_conduits(required_flow_rate, conduit_types)
         dist *= total_cost  # Use the total cost as the weight
         if dist < dist_matrix[u, v]:
             dist_matrix[u, v] = dist
@@ -65,12 +67,14 @@ def create_distance_matrix(nodes, edges, distance_func, use_gpu, required_curren
     return dist_matrix
 
 
-def compute_metric_closure_with_steiner(nodes, edges, distance_func, use_gpu, required_currents, cable_types):
-    dist_matrix = create_distance_matrix(nodes, edges, distance_func, use_gpu, required_currents, cable_types)
+def compute_metric_closure_with_steiner(nodes, edges, distance_func, use_gpu, required_flow_rates, conduit_types):
+
+    dist_matrix = create_distance_matrix(nodes, edges, distance_func, use_gpu, required_flow_rates, conduit_types)
     sources, targets, weights = [], [], []
     n = len(nodes)
 
     if use_gpu:
+
         for i in range(n):
             for j in range(i + 1, n):
                 if dist_matrix[i, j] < (cp.inf if use_gpu else np.inf):
@@ -81,6 +85,7 @@ def compute_metric_closure_with_steiner(nodes, edges, distance_func, use_gpu, re
         df = cudf.DataFrame({'src': sources, 'dst': targets, 'weight': weights})
         G = cugraph.Graph()
         G.from_cudf_edgelist(df, source='src', destination='dst', edge_attr='weight')
+
         # Convert G to a Python list of lists
         df_pandas = df.to_pandas()
         num_nodes = max(df_pandas['src'].max(), df_pandas['dst'].max()) + 1
@@ -90,19 +95,18 @@ def compute_metric_closure_with_steiner(nodes, edges, distance_func, use_gpu, re
             adj_matrix[int(row['src']), int(row['dst'])] = row['weight']
             adj_matrix[int(row['dst']), int(row['src'])] = row['weight']  # Assuming undirected graph
 
-        # Convert adjacency matrix to list of lists
-        adj_matrix_list = adj_matrix.tolist()
-        dist_matrix_gpu = fw_gpu(adj_matrix_list)
-        # Convert the distance matrix to a CuPy array
-        dist_matrix_gpu = cp.asarray(dist_matrix_gpu)
+        # Convert adjacency matrix to list of lists, then the resulting distance matrix to a CuPy array.
+        return cp.asarray(fw_gpu(adj_matrix.tolist()))
 
-        return dist_matrix_gpu
     else:
+
         dist_matrix_cpu = np.zeros((n, n), dtype=np.float64)
+
         for i in range(n):
             for j in range(i + 1, n):
                 dist_matrix_cpu[i, j] = dist_matrix[i, j]
                 dist_matrix_cpu[j, i] = dist_matrix[i, j]
+
         return fw_cpu(dist_matrix_cpu, directed=False)
 
 
@@ -110,6 +114,7 @@ def construct_mst_on_terminals(terminals, metric_closure, use_gpu):
     """
     Construct an MST using only terminal nodes, based on the metric closure.
     """
+
     sources, targets, weights = [], [], []
 
     for i in range(len(terminals)):
@@ -122,12 +127,15 @@ def construct_mst_on_terminals(terminals, metric_closure, use_gpu):
                 weights.append(metric_closure[i, j])
 
     if use_gpu:
+
         df = cudf.DataFrame({'src': sources, 'dst': targets, 'weight': weights})
         G = cugraph.Graph()
         G.from_cudf_edgelist(df, source='src', destination='dst', edge_attr='weight')
         mst = cugraph.minimum_spanning_tree(G)
         return mst
+
     else:
+
         G = nx.Graph()
         for src, dst, weight in zip(sources, targets, weights):
             G.add_edge(src, dst, weight=weight)
@@ -139,10 +147,10 @@ def shortest_path(graph, source, target, weight='weight'):
     return nx.shortest_path(graph, source=source, target=target, weight=weight)
 
 
-def steiner_tree_approximation(graph, distance_func_gpu, distance_func_cpu, use_gpu):
+def approximate_steiner_minimal_tree(graph, distance_func, use_gpu):
 
     purge_unreachable_subgraphs(graph)
-    node_coords, node_ids, terminals, edges, required_currents, cable_types = extract_graph_components(graph)
+    node_coords, node_ids, terminals, edges, required_flow_rates, conduit_types = extract_graph_components(graph)
 
     if use_gpu:
         nodes = cp.array(node_coords, dtype=cp.float64)
@@ -150,9 +158,7 @@ def steiner_tree_approximation(graph, distance_func_gpu, distance_func_cpu, use_
         nodes = np.array(node_coords, dtype=np.float64)
 
     # Step 1: Compute metric closure using the specified distance function
-    distance_func = distance_func_gpu if use_gpu else distance_func_cpu
-
-    metric_closure = compute_metric_closure_with_steiner(nodes, edges, distance_func, use_gpu, required_currents, cable_types)
+    metric_closure = compute_metric_closure_with_steiner(nodes, edges, distance_func, use_gpu, required_flow_rates, conduit_types)
 
     # Step 2: Construct MST from the metric closure
     mst = construct_mst_on_terminals(terminals, metric_closure, use_gpu)
@@ -160,10 +166,10 @@ def steiner_tree_approximation(graph, distance_func_gpu, distance_func_cpu, use_
     # Step 3: Steiner node addition
     original_graph = nx.MultiGraph()
     for (u, v, attrs) in edges:
-        distance = distance_func(nodes[u], nodes[v])
-        required_current = required_currents.get((u, v), 0)
-        num_cables, total_cost = calculate_optimal_cables(required_current, cable_types)
-        original_graph.add_edge(u, v, weight=distance, num_cables=num_cables, total_cost=total_cost)
+        distance = distance_func(nodes[u], nodes[v], use_gpu)
+        required_flow_rate = required_flow_rates.get((u, v), 0)
+        num_conduits, total_cost = calculate_optimal_conduits(required_flow_rate, conduit_types)
+        original_graph.add_edge(u, v, weight=distance, num_conduits=num_conduits, total_cost=total_cost)
 
     steiner_tree = nx.MultiGraph()
 
@@ -174,9 +180,9 @@ def steiner_tree_approximation(graph, distance_func_gpu, distance_func_cpu, use_
         #     return
         for i in range(len(path) - 1):
             u, v = path[i], path[i + 1]
-            num_cables = original_graph[u][v][0]['num_cables']
+            num_conduits = original_graph[u][v][0]['num_conduits']
             total_cost = original_graph[u][v][0]['total_cost']
-            steiner_tree.add_edge(u, v, weight=original_graph[u][v][0]['weight'], num_cables=num_cables, total_cost=total_cost)
+            steiner_tree.add_edge(u, v, weight=original_graph[u][v][0]['weight'], num_conduits=num_conduits, total_cost=total_cost)
 
     with ThreadPoolExecutor() as executor:
         futures = [executor.submit(add_shortest_path, u, v) for u, v in mst.edges()]
@@ -242,7 +248,7 @@ def create_nx_graph(edges, nodes):
 
 def purge_unreachable_subgraphs(graph):
 
-    G = create_nx_graph(graph[GRAPH_EDGES_KEY], graph[GRAPH_NODE_COORDS_KEY])
+    G = create_nx_graph(graph[GRAPH_EDGES], graph[GRAPH_NODE_COORDS])
     reachable_nodes, unreachable_nodes = partition_nx_graph_by_reachability(G)
 
     if unreachable_nodes:
@@ -256,31 +262,32 @@ def purge_unreachable_subgraphs(graph):
 
             print('Removing node:', node_index)
 
-            if node_index in graph[GRAPH_TERMINALS_KEY]:
+            if node_index in graph[GRAPH_TERMINALS]:
                 raise ValueError('A terminal node is unreachable.')
 
-            graph[GRAPH_NODE_COORDS_KEY].pop(node_index)
-            graph[GRAPH_NODE_IDS_KEY].pop(node_index)
-            graph[GRAPH_TERMINALS_KEY] = [t - 1 if t > node_index else t for t in graph[GRAPH_TERMINALS_KEY]]
-            graph[GRAPH_EDGES_KEY] = [edge for edge in graph[GRAPH_EDGES_KEY] if edge[0] != node_index and edge[1] != node_index]
-            graph[GRAPH_REQUIRED_CURRENTS_KEY] = {k: v for k, v in graph[GRAPH_REQUIRED_CURRENTS_KEY].items() if k[0] != node_index and k[1] != node_index}
+            graph[GRAPH_NODE_COORDS].pop(node_index)
+            graph[GRAPH_NODE_IDS].pop(node_index)
+            graph[GRAPH_TERMINALS] = [t - 1 if t > node_index else t for t in graph[GRAPH_TERMINALS]]
+            graph[GRAPH_EDGES] = [edge for edge in graph[GRAPH_EDGES] if edge[0] != node_index and edge[1] != node_index]
+            graph[GRAPH_REQUIRED_FLOW_RATES] = {k: v for k, v in graph[GRAPH_REQUIRED_FLOW_RATES].items() if k[0] != node_index and k[1] != node_index}
 
             # Adjust the indices of the remaining nodes in the edges.
-            for i, edge in enumerate(graph[GRAPH_EDGES_KEY]):
+            for i, edge in enumerate(graph[GRAPH_EDGES]):
                 if edge[0] > node_index or edge[1] > node_index:
                     new_edge = (edge[0] - 1 if edge[0] > node_index else edge[0], edge[1] - 1 if edge[1] > node_index else edge[1], edge[2])
-                    graph[GRAPH_EDGES_KEY][i] = new_edge
+                    graph[GRAPH_EDGES][i] = new_edge
 
         # plot_graph_with_unreachable_nodes(G, reachable_nodes, unreachable_nodes)
         # exit(0)
 
 
 def extract_graph_components(graph):
-    node_coords = graph[GRAPH_NODE_COORDS_KEY]
-    node_ids = graph[GRAPH_NODE_IDS_KEY]
-    terminals = graph[GRAPH_TERMINALS_KEY]
-    edges = graph[GRAPH_EDGES_KEY]
-    required_currents = graph[GRAPH_REQUIRED_CURRENTS_KEY]
-    cable_types = graph[GRAPH_CABLE_TYPES_KEY]
 
-    return node_coords, node_ids, terminals, edges, required_currents, cable_types
+    node_coords = graph[GRAPH_NODE_COORDS]
+    node_ids = graph[GRAPH_NODE_IDS]
+    terminals = graph[GRAPH_TERMINALS]
+    edges = graph[GRAPH_EDGES]
+    required_flow_rates = graph[GRAPH_REQUIRED_FLOW_RATES]
+    conduit_types = graph[GRAPH_CONDUIT_TYPES]
+
+    return node_coords, node_ids, terminals, edges, required_flow_rates, conduit_types

@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "modgeosys-cuda-graph-algorithms"
-version = "0.2.4"
+version = "0.2.9"
 description = ""
 authors = ["Kevin Weller <klweller@icloud.com>"]
 readme = "README.md"

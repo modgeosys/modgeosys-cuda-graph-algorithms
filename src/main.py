@@ -1,19 +1,12 @@
 """Usage example(s)."""
 
 import pickle
-from audioop import reverse
 
-import numpy as np
-import cupy as cp
-
-from modgeosys.graph.cuda.steiner import use_gpu, manhattan_distance, euclidean_distance, steiner_tree_approximation, purge_unreachable_subgraphs
+from modgeosys.graph.cuda.steiner import manhattan_distance, euclidean_distance, approximate_steiner_minimal_tree, is_gpu_available
 
 
 # Press the green button in the gutter to run the script.
 if __name__ == '__main__':
-    with open('/home/kweller/graph.pickle', 'rb') as pickled_sample_larger_graph_file:
-        graph = pickle.load(pickled_sample_larger_graph_file)
-
     # Example usage
     # if use_gpu:
     #     nodes = cp.array([(0, 0), (0, 1), (1, 0), (1, 1), (2, 2)], dtype=cp.float32)
@@ -47,9 +40,13 @@ if __name__ == '__main__':
     #     {'capacity': 30, 'cost': 2.5}
     # ]
 
-    steiner_tree_manhattan = steiner_tree_approximation(graph, manhattan_distance, manhattan_distance, use_gpu)
-    # steiner_tree_euclidean = steiner_tree_approximation(graph, euclidean_distance, euclidean_distance, use_gpu)
+    with open('/home/kweller/graph.pickle', 'rb') as pickled_sample_larger_graph_file:
+        graph = pickle.load(pickled_sample_larger_graph_file)
 
-    print('Steiner tree (Manhattan distance): ', steiner_tree_manhattan.edges(data=True))
-    print('Length of Steiner tree (Manhattan distance): ', len(steiner_tree_manhattan.edges(data=True)))
-    # print('Steiner tree (Euclidean distance): ', steiner_tree_euclidean.edges(data=True))
+    use_gpu = False # is_gpu_available()
+    steiner_minimal_tree_manhattan = approximate_steiner_minimal_tree(graph, manhattan_distance, use_gpu)
+    # steiner_minimal_tree_euclidean = approximate_steiner_minimal_tree(graph, euclidean_distance, )
+
+    print('Steiner minimal tree (Manhattan distance): ', steiner_minimal_tree_manhattan.edges(data=True))
+    print('Length of Steiner minimal tree (Manhattan distance): ', len(steiner_minimal_tree_manhattan.edges(data=True)))
+    # print('Steiner minimal tree (Euclidean distance): ', steiner_minimal_tree_euclidean.edges(data=True))
