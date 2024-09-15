@@ -67,7 +67,7 @@ def create_distance_matrix(nodes, edges, distance_func, use_gpu, required_flow_r
     return dist_matrix
 
 
-def compute_metric_closure_with_steiner(nodes, edges, distance_func, use_gpu, required_flow_rates, conduit_types):
+def compute_metric_closure_with_steiner(nodes, edges, required_flow_rates, conduit_types, distance_func, use_gpu):
 
     dist_matrix = create_distance_matrix(nodes, edges, distance_func, use_gpu, required_flow_rates, conduit_types)
     sources, targets, weights = [], [], []
@@ -110,12 +110,12 @@ def compute_metric_closure_with_steiner(nodes, edges, distance_func, use_gpu, re
         return fw_cpu(dist_matrix_cpu, directed=False)
 
 
-def construct_mst_on_terminals(terminals, metric_closure, use_gpu):
+def construct_minimum_spanning_tree_on_terminals(terminals, node_coords, metric_closure, use_gpu, mst_algorithm='boruvka'):
     """
     Construct an MST using only terminal nodes, based on the metric closure.
     """
 
-    sources, targets, weights = [], [], []
+    sources, targets, weights, node_coords_set = [], [], [], set()
 
     for i in range(len(terminals)):
         for j in range(i + 1, len(terminals)):
@@ -125,21 +125,26 @@ def construct_mst_on_terminals(terminals, metric_closure, use_gpu):
                 sources.append(u)
                 targets.append(v)
                 weights.append(metric_closure[i, j])
+                node_coords_set.add(node_coords[u])
+                node_coords_set.add(node_coords[v])
 
     if use_gpu:
 
         df = cudf.DataFrame({'src': sources, 'dst': targets, 'weight': weights})
         G = cugraph.Graph()
         G.from_cudf_edgelist(df, source='src', destination='dst', edge_attr='weight')
-        mst = cugraph.minimum_spanning_tree(G)
+        mst = cugraph.minimum_spanning_tree(G, algorithm=mst_algorithm)
         return mst
 
     else:
 
         G = nx.Graph()
+        # Add nodes with coordinates as attributes
+        for i, coord in enumerate(node_coords):
+            G.add_node(i, pos=coord[0:2])
         for src, dst, weight in zip(sources, targets, weights):
             G.add_edge(src, dst, weight=weight)
-        mst = nx.minimum_spanning_tree(G)
+        mst = nx.minimum_spanning_tree(G, algorithm=mst_algorithm)
         return mst
 
 
@@ -147,37 +152,25 @@ def shortest_path(graph, source, target, weight='weight'):
     return nx.shortest_path(graph, source=source, target=target, weight=weight)
 
 
-def approximate_steiner_minimal_tree(graph, distance_func, use_gpu):
+def approximate_steiner_minimal_tree(graph, distance_func, use_gpu, mst_algorithm='boruvka'):
 
-    purge_unreachable_subgraphs(graph)
-    node_coords, node_ids, terminals, edges, required_flow_rates, conduit_types = extract_graph_components(graph)
-
-    if use_gpu:
-        nodes = cp.array(node_coords, dtype=cp.float64)
-    else:
-        nodes = np.array(node_coords, dtype=np.float64)
-
-    # Step 1: Compute metric closure using the specified distance function
-    metric_closure = compute_metric_closure_with_steiner(nodes, edges, distance_func, use_gpu, required_flow_rates, conduit_types)
-
-    # Step 2: Construct MST from the metric closure
-    mst = construct_mst_on_terminals(terminals, metric_closure, use_gpu)
+    mst, nodes, node_coords, node_ids, terminals, edges, required_flow_rates, conduit_types = construct_minimum_spanning_tree(graph, distance_func, use_gpu, mst_algorithm)
 
     # Step 3: Steiner node addition
     original_graph = nx.MultiGraph()
     for (u, v, attrs) in edges:
-        distance = distance_func(nodes[u], nodes[v], use_gpu)
+        distance = distance_func(node_coords[u], node_coords[v], use_gpu)
         required_flow_rate = required_flow_rates.get((u, v), 0)
         num_conduits, total_cost = calculate_optimal_conduits(required_flow_rate, conduit_types)
         original_graph.add_edge(u, v, weight=distance, num_conduits=num_conduits, total_cost=total_cost)
 
     steiner_tree = nx.MultiGraph()
 
+    for i, coord in enumerate(node_coords):
+        steiner_tree.add_node(i, pos=coord[0:2])
+
     def add_shortest_path(u, v):
-        # try:
         path = shortest_path(original_graph, u, v)
-        # except nx.exception.NetworkXNoPath:
-        #     return
         for i in range(len(path) - 1):
             u, v = path[i], path[i + 1]
             num_conduits = original_graph[u][v][0]['num_conduits']
@@ -189,10 +182,28 @@ def approximate_steiner_minimal_tree(graph, distance_func, use_gpu):
         for future in futures:
             future.result()
 
-    return steiner_tree
+    return steiner_tree, nodes, node_coords, node_ids, terminals, edges, required_flow_rates, conduit_types
 
 
-def plot_graph_with_unreachable_nodes(G, reachable_nodes, unreachable_nodes, width=15, height=12):
+def construct_minimum_spanning_tree(graph, distance_func, use_gpu, mst_algorithm='boruvka'):
+    purge_unreachable_subgraphs(graph)
+    node_coords, node_ids, terminals, edges, required_flow_rates, conduit_types = extract_graph_components(graph)
+
+    if use_gpu:
+        nodes = cp.array(node_coords, dtype=cp.float64)
+    else:
+        nodes = np.array(node_coords, dtype=np.float64)
+
+    # Step 1: Compute metric closure using the specified distance function
+    metric_closure = compute_metric_closure_with_steiner(nodes, edges, required_flow_rates, conduit_types, distance_func, use_gpu)
+
+    # Step 2: Construct MST from the metric closure
+    mst = construct_minimum_spanning_tree_on_terminals(terminals, node_coords, metric_closure, use_gpu, mst_algorithm)
+
+    return mst, nodes, node_coords, node_ids, terminals, edges, required_flow_rates, conduit_types
+
+
+def plot_graph_with_highlighted_nodes(G, regular_nodes, highlighted_nodes, width=15, height=12):
     # Set the figure size
     fig, ax = plt.subplots(figsize=(width, height))
 
@@ -200,20 +211,20 @@ def plot_graph_with_unreachable_nodes(G, reachable_nodes, unreachable_nodes, wid
     pos = nx.get_node_attributes(G, 'pos')
 
     # Draw the graph using the positions
-    nodes_draw = nx.draw_networkx_nodes(G, pos, ax=ax, nodelist=reachable_nodes, node_color='lightblue', node_size=10)
+    # nodes_draw = nx.draw_networkx_nodes(G, pos, ax=ax, nodelist=regular_nodes, node_color='lightblue', node_size=5)
     edges_draw = nx.draw_networkx_edges(G, pos, ax=ax, edge_color='gray')
 
     # Highlight unreachable nodes
-    unreachable_nodes_draw = nx.draw_networkx_nodes(G, pos, ax=ax, nodelist=unreachable_nodes, node_color='red', node_size=10)
+    highlighted_nodes_draw = nx.draw_networkx_nodes(G, pos, ax=ax, nodelist=highlighted_nodes, node_color='red', node_size=5)
 
     # Add tooltips for reachable nodes
-    node_labels = {node: f"Node {node}\nPos: {pos[node]}" for node in reachable_nodes}
-    node_tooltips = plugins.PointLabelTooltip(nodes_draw, labels=[node_labels[n] for n in reachable_nodes])
-    plugins.connect(fig, node_tooltips)
+    # node_labels = {node: f"Node {node}\nPos: {pos[node]}" for node in regular_nodes}
+    # node_tooltips = plugins.PointLabelTooltip(nodes_draw, labels=[node_labels[n] for n in regular_nodes])
+    # plugins.connect(fig, node_tooltips)
 
     # Add tooltips for unreachable nodes
-    unreachable_node_labels = {node: f"Node {node}\nPos: {pos[node]}" for node in unreachable_nodes}
-    unreachable_node_tooltips = plugins.PointLabelTooltip(unreachable_nodes_draw, labels=[unreachable_node_labels[n] for n in unreachable_nodes])
+    unreachable_node_labels = {node: f"Node {node}\nPos: {pos[node]}" for node in highlighted_nodes}
+    unreachable_node_tooltips = plugins.PointLabelTooltip(highlighted_nodes_draw, labels=[unreachable_node_labels[n] for n in highlighted_nodes])
     plugins.connect(fig, unreachable_node_tooltips)
 
     # Add tooltips for edges
@@ -221,13 +232,14 @@ def plot_graph_with_unreachable_nodes(G, reachable_nodes, unreachable_nodes, wid
     edge_tooltips = plugins.LineHTMLTooltip(edges_draw, [edge_labels[e] for e in G.edges()])
     plugins.connect(fig, edge_tooltips)
 
-    plt.title("Graph with Unreachable Nodes Highlighted", fontsize=12, pad=20)
+    plt.title("Graph with Highlighted Nodes", fontsize=12, pad=20)
     mpld3.show()
 
 
-def partition_nx_graph_by_reachability(G):
+def partition_nx_graph_by_reachability(G, start_node=None):
     # Choose a starting node (e.g., the first node in the list)
-    start_node = 0
+    if start_node is None:
+        start_node = next(iter(G.nodes))
     # Perform BFS or DFS to check reachability
     reachable_nodes = nx.node_connected_component(G, start_node)
     # Find unreachable nodes
@@ -235,11 +247,11 @@ def partition_nx_graph_by_reachability(G):
     return reachable_nodes, unreachable_nodes
 
 
-def create_nx_graph(edges, nodes):
+def create_nx_graph(edges, node_coords):
     # Create a graph
     G = nx.Graph()
     # Add nodes with coordinates as attributes
-    for i, coord in enumerate(nodes):
+    for i, coord in enumerate(node_coords):
         G.add_node(i, pos=coord[0:2])
     # Add edges
     G.add_edges_from([(u, v) for u, v, _ in edges])
