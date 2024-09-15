@@ -115,7 +115,7 @@ def construct_minimum_spanning_tree_on_terminals(terminals, node_coords, metric_
     Construct an MST using only terminal nodes, based on the metric closure.
     """
 
-    sources, targets, weights, node_coords_set = [], [], [], set()
+    sources, targets, weights = [], [], []
 
     for i in range(len(terminals)):
         for j in range(i + 1, len(terminals)):
@@ -125,8 +125,6 @@ def construct_minimum_spanning_tree_on_terminals(terminals, node_coords, metric_
                 sources.append(u)
                 targets.append(v)
                 weights.append(metric_closure[i, j])
-                node_coords_set.add(node_coords[u])
-                node_coords_set.add(node_coords[v])
 
     if use_gpu:
 
